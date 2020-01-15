@@ -38,6 +38,19 @@ int megaraid_io_interface(int device, int target, struct scsi_cmnd_io *, int);
 #define MAX_REQ_SENSE_LEN  0x20
 #define MAX_CDB_LEN 10
 
+#ifdef _MSC_VER
+struct iovec {
+  void *iov_base;   /* Starting address */
+  size_t iov_len;   /* Number of bytes */
+};
+#endif
+
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4103)
+#endif
+
+#include "packed.h"
 typedef struct
 {
   uint8_t  timeout : 3;
@@ -57,8 +70,10 @@ typedef struct
   uint8_t  scsistatus;
   uint32_t dataxferaddr;
   uint32_t dataxferlen;
-} __attribute__((packed)) mega_passthru;
+} PACKED mega_passthru;
+#include "endpacked.h"
 
+#include "packed.h"
 typedef struct
 {
   uint8_t   cmd;
@@ -71,7 +86,8 @@ typedef struct
   uint8_t   resvd[3];
   uint8_t   numstatus;
   uint8_t   status;
-} __attribute__((packed)) megacmd_t;
+} PACKED megacmd_t;
+#include "endpacked.h"
 
 typedef union {
   uint8_t   *pointer;
@@ -87,6 +103,7 @@ typedef union {
 // use megaraid support in smartmontools.
 typedef char assert_sizeof_ptr_t[sizeof(ptr_t) == 8 ? 1 : -1];
 
+#include "packed.h"
 struct uioctl_t
 {
   uint32_t       inlen;
@@ -99,13 +116,14 @@ struct uioctl_t
       uint16_t adapno;
       ptr_t    buffer;
       uint32_t length;
-    } __attribute__((packed)) fcs;
-  } __attribute__((packed)) ui;
+    } PACKED fcs;
+  } PACKED ui;
   
   megacmd_t     mbox;
   mega_passthru pthru;
   ptr_t         data;
-} __attribute__((packed));
+} PACKED;
+#include "endpacked.h"
 
 /*===================================================
 * PERC5/6 Passthrough SCSI Command Interface
@@ -133,27 +151,34 @@ struct uioctl_t
 
 #define MAX_SYS_PDS               240
 
+#include "packed.h"
 struct megasas_sge32 {
   
   u32 phys_addr;
   u32 length;
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_sge64 {
   
   u64 phys_addr;
   u32 length;
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 union megasas_sgl {
   
   struct megasas_sge32 sge32[1];
   struct megasas_sge64 sge64[1];
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_header {
   
   u8 cmd;           /*00h */
@@ -173,8 +198,10 @@ struct megasas_header {
   u16 timeout;      /*12h */
   u32 data_xferlen; /*14h */
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_pthru_frame {
   
   u8 cmd;            /*00h */
@@ -200,8 +227,10 @@ struct megasas_pthru_frame {
   u8 cdb[16];            /*20h */
   union megasas_sgl sgl; /*30h */
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_dcmd_frame {
   
   u8 cmd;            /*00h */
@@ -227,8 +256,10 @@ struct megasas_dcmd_frame {
   
   union megasas_sgl sgl; /*28h */
   
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_iocpacket {
   u16 host_no;
   u16 __pad1;
@@ -244,8 +275,10 @@ struct megasas_iocpacket {
   } frame;
   
   struct iovec sgl[MAX_IOCTL_SGE];
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_pd_address {
   u16 device_id;
   u16 encl_device_id;
@@ -254,13 +287,31 @@ struct megasas_pd_address {
   u8 scsi_dev_type; /* 0 = disk */
   u8 connect_port_bitmap;
   u64 sas_addr[2];
-}   __attribute__ ((packed));
+}   PACKED;
+#include "endpacked.h"
 
+#include "packed.h"
 struct megasas_pd_list {
   u32 size;
   u32 count;
   struct megasas_pd_address addr[MAX_SYS_PDS];
-} __attribute__ ((packed));
+} PACKED;
+#include "endpacked.h"
+
+#ifdef _WIN32
+#include "packed.h"
+struct win_megasas_io
+{
+  SRB_IO_CONTROL SRB;
+  u8 Payload[160]; // Fixed size in Windows
+  u8 DataBuffer[1];
+} PACKED;
+#include "endpacked.h"
+#endif
+
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #undef u8
 #undef u16

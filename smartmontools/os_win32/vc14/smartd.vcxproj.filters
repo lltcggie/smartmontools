@@ -125,6 +125,9 @@
     <ClInclude Include="..\popen.h">
       <Filter>os_win32</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\megaraid.h" />
+    <ClInclude Include="..\..\packed.h" />
+    <ClInclude Include="..\..\endpacked.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\installer.nsi">
@@ -165,7 +168,6 @@
   <ItemGroup>
     <CustomBuildStep Include="..\..\ataprint.h" />
     <CustomBuildStep Include="..\..\cciss.h" />
-    <CustomBuildStep Include="..\..\megaraid.h" />
     <CustomBuildStep Include="..\..\os_darwin.h" />
     <CustomBuildStep Include="..\..\os_freebsd.h" />
     <CustomBuildStep Include="..\..\os_generic.h" />

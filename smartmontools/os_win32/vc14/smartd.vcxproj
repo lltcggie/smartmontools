@@ -301,6 +301,7 @@
     </ClInclude>
     <ClInclude Include="..\..\dev_areca.h" />
     <ClInclude Include="..\..\dev_intelliprop.h" />
+    <ClInclude Include="..\..\endpacked.h" />
     <ClInclude Include="..\..\getopt\bits\getopt_core.h" />
     <ClInclude Include="..\..\getopt\bits\getopt_ext.h" />
     <ClInclude Include="..\..\getopt\getopt_int.h" />
@@ -311,6 +312,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
     </ClInclude>
+    <ClInclude Include="..\..\packed.h" />
     <ClInclude Include="..\..\static_assert.h" />
     <ClInclude Include="..\daemon_win32.h" />
     <ClInclude Include="..\popen.h" />
@@ -347,12 +349,7 @@
     <ClInclude Include="..\..\dev_tunnelled.h" />
     <ClInclude Include="..\..\drivedb.h" />
     <ClInclude Include="..\..\knowndrives.h" />
-    <CustomBuildStep Include="..\..\megaraid.h">
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">true</ExcludedFromBuild>
-      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64'">true</ExcludedFromBuild>
-    </CustomBuildStep>
+    <ClInclude Include="..\..\megaraid.h" />
     <CustomBuildStep Include="..\..\os_darwin.h">
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">true</ExcludedFromBuild>

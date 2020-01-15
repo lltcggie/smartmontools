@@ -81,6 +81,9 @@ extern unsigned char failuretest_permissive;
 // aacraid support
 #include "aacraid.h"
 
+// megaraid support
+#include "megaraid.h"
+
 #ifndef _WIN64
 #define SELECT_WIN_32_64(x32, x64) (x32)
 #else
@@ -4023,6 +4026,11 @@ protected:
 
 private:
   smart_device * get_usb_device(const char * name, int phydrive, int logdrive = -1);
+
+  bool get_dev_megasas(smart_device_list & devlist);
+  int megasas_dcmd_cmd(int bus_no, uint32_t opcode, void *buf,
+    size_t bufsize, uint8_t *mbox, size_t mboxlen, uint8_t *statusp);
+  int megasas_pd_add_list(int bus_no, smart_device_list & devlist);
 };
 
 
@@ -4189,12 +4197,346 @@ nvme_device * win_smart_interface::get_nvme_device(const char * name, const char
 }
 
 
+/////////////////////////////////////////////////////////////////////////////
+/// LSI MegaRAID support
+
+class win_megaraid_device
+  : public /* implements */ scsi_device,
+  public /* extends */ win_smart_device
+{
+public:
+  win_megaraid_device(smart_interface *intf, const char *name,
+    unsigned int tgt);
+
+  virtual ~win_megaraid_device() throw();
+
+  virtual smart_device * autodetect_open();
+
+  virtual bool open();
+  virtual bool close();
+
+  virtual bool scsi_pass_through(scsi_cmnd_io *iop);
+
+private:
+  unsigned int m_disknum;
+  unsigned int m_hba;
+
+  bool (win_megaraid_device::*pt_cmd)(int cdblen, void *cdb, int dataLen, void *data,
+    int senseLen, void *sense, int report, int direction);
+  bool megasas_cmd(int cdbLen, void *cdb, int dataLen, void *data,
+    int senseLen, void *sense, int report, int direction);
+  bool megadev_cmd(int cdbLen, void *cdb, int dataLen, void *data,
+    int senseLen, void *sense, int report, int direction);
+};
+
+win_megaraid_device::win_megaraid_device(smart_interface *intf,
+  const char *dev_name, unsigned int tgt)
+  : smart_device(intf, dev_name, "megaraid", "megaraid"),
+  win_smart_device(),
+  m_disknum(tgt), m_hba(0),
+  pt_cmd(0)
+{
+  set_info().info_name = strprintf("%s [megaraid_disk_%02d]", dev_name, m_disknum);
+  set_info().dev_type = strprintf("megaraid,%d", tgt);
+}
+
+win_megaraid_device::~win_megaraid_device() throw()
+{
+}
+
+smart_device * win_megaraid_device::autodetect_open()
+{
+  int report = scsi_debugmode;
+
+  // Open device
+  if (!open())
+    return this;
+
+  // The code below is based on smartd.cpp:SCSIFilterKnown()
+  if (strcmp(get_req_type(), "megaraid"))
+    return this;
+
+  // Get INQUIRY
+  unsigned char req_buff[64] = { 0, };
+  int req_len = 36;
+  if (scsiStdInquiry(this, req_buff, req_len)) {
+    close();
+    set_err(EIO, "INQUIRY failed");
+    return this;
+  }
+
+  int avail_len = req_buff[4] + 5;
+  int len = (avail_len < req_len ? avail_len : req_len);
+  if (len < 36)
+    return this;
+
+  if (report)
+    pout("Got MegaRAID inquiry.. %s\n", req_buff + 8);
+
+  // Use INQUIRY to detect type
+  {
+    // SAT?
+    ata_device * newdev = smi()->autodetect_sat_device(this, req_buff, len);
+    if (newdev) // NOTE: 'this' is now owned by '*newdev'
+      return newdev;
+  }
+
+  // Nothing special found
+  return this;
+}
+
+bool win_megaraid_device::open()
+{
+  if (is_open())
+    return true;
+
+  int pd_num = -1;
+  const char * name = skipdev(get_dev_name()); int len = strlen(name);
+  // sd[a-z]([a-z])?,N => Physical drive 0-701, RAID port N
+  char drive[2 + 1] = ""; int sub_addr = -1; int n1 = -1; int n2 = -1;
+  if (sscanf(name, "sd%2[a-z]%n,%d%n", drive, &n1, &sub_addr, &n2) >= 1
+    && ((n1 == len && sub_addr == -1) || (n2 == len && sub_addr >= 0))) {
+    pd_num = sdxy_to_phydrive(drive);
+   // return open(sdxy_to_phydrive(drive), -1, -1, sub_addr);
+  }
+  if (pd_num < 0) {
+    // pd<m>,N => Physical drive <m>, RAID port N
+    n1 = -1; n2 = -1;
+    if (sscanf(name, "pd%d%n,%d%n", &pd_num, &n1, &sub_addr, &n2) >= 1
+      && pd_num >= 0 && ((n1 == len && sub_addr == -1) || (n2 == len && sub_addr >= 0))) {
+      //return open(pd_num);
+    }
+  }
+
+  if (pd_num < 0) {
+    return false;
+  }
+
+  char line[128];
+  snprintf(line, sizeof(line) - 1, "\\\\.\\scsi%d:", pd_num);
+
+  HANDLE h = CreateFileA(line, GENERIC_READ | GENERIC_WRITE,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  if (h == INVALID_HANDLE_VALUE) {
+    return false;
+  }
+
+  set_fh(h);
+  pt_cmd = &win_megaraid_device::megasas_cmd;
+  return true;
+}
+
+bool win_megaraid_device::close()
+{
+  bool ret = win_smart_device::close();
+
+  m_hba = 0; pt_cmd = NULL;
+  return ret;
+}
+
+bool win_megaraid_device::scsi_pass_through(scsi_cmnd_io *iop)
+{
+  int report = scsi_debugmode;
+
+  if (report > 0) {
+    int k, j;
+    const unsigned char * ucp = iop->cmnd;
+    const char * np;
+    char buff[256];
+    const int sz = (int)sizeof(buff);
+
+    np = scsi_get_opcode_name(ucp[0]);
+    j = snprintf(buff, sz, " [%s: ", np ? np : "<unknown opcode>");
+    for (k = 0; k < (int)iop->cmnd_len; ++k)
+      j += snprintf(&buff[j], (sz > j ? (sz - j) : 0), "%02x ", ucp[k]);
+    if ((report > 1) &&
+      (DXFER_TO_DEVICE == iop->dxfer_dir) && (iop->dxferp)) {
+      int trunc = (iop->dxfer_len > 256) ? 1 : 0;
+
+      snprintf(&buff[j], (sz > j ? (sz - j) : 0), "]\n  Outgoing "
+        "data, len=%d%s:\n", (int)iop->dxfer_len,
+        (trunc ? " [only first 256 bytes shown]" : ""));
+      dStrHex(iop->dxferp, (trunc ? 256 : iop->dxfer_len), 1);
+    }
+    else
+      snprintf(&buff[j], (sz > j ? (sz - j) : 0), "]\n");
+    pout("%s", buff);
+  }
+
+  // Controller rejects Test Unit Ready
+  if (iop->cmnd[0] == 0x00)
+    return true;
+
+  if (iop->cmnd[0] == SAT_ATA_PASSTHROUGH_12 || iop->cmnd[0] == SAT_ATA_PASSTHROUGH_16) {
+    // Controller does not return ATA output registers in SAT sense data
+    if (iop->cmnd[2] & (1 << 5)) // chk_cond
+      return set_err(ENOSYS, "ATA return descriptor not supported by controller firmware");
+  }
+  // SMART WRITE LOG SECTOR causing media errors
+  if ((iop->cmnd[0] == SAT_ATA_PASSTHROUGH_16 // SAT16 WRITE LOG
+    && iop->cmnd[14] == ATA_SMART_CMD && iop->cmnd[3] == 0 && iop->cmnd[4] == ATA_SMART_WRITE_LOG_SECTOR) ||
+    (iop->cmnd[0] == SAT_ATA_PASSTHROUGH_12 // SAT12 WRITE LOG
+      && iop->cmnd[9] == ATA_SMART_CMD && iop->cmnd[3] == ATA_SMART_WRITE_LOG_SECTOR))
+  {
+    if (!failuretest_permissive)
+      return set_err(ENOSYS, "SMART WRITE LOG SECTOR may cause problems, try with -T permissive to force");
+  }
+  if (pt_cmd == NULL)
+    return false;
+  return (this->*pt_cmd)(iop->cmnd_len, iop->cmnd,
+    iop->dxfer_len, iop->dxferp,
+    iop->max_sense_len, iop->sensep, report, iop->dxfer_dir);
+  return false;
+}
+
+/* Issue passthrough scsi command to PERC5/6 controllers */
+bool win_megaraid_device::megasas_cmd(int cdbLen, void *cdb,
+  int dataLen, void *data,
+  int /*senseLen*/, void * /*sense*/, int /*report*/, int dxfer_dir)
+{
+  const size_t ioc_size = sizeof(win_megasas_io) + dataLen;
+  win_megasas_io *ioc = (win_megasas_io *)malloc(ioc_size);
+  memset(ioc, 0, ioc_size);
+
+  ioc->SRB.HeaderLength = sizeof(SRB_IO_CONTROL);
+  memcpy(ioc->SRB.Signature, "LSILOGIC", 8);
+  ioc->SRB.Timeout = 0;
+  ioc->SRB.ControlCode = 0;
+  ioc->SRB.Length = sizeof(ioc->Payload) + 1 + dataLen;
+
+  struct megasas_pthru_frame	*pthru;
+  pthru = (megasas_pthru_frame *)&ioc->Payload;
+
+  pthru->cmd = MFI_CMD_PD_SCSI_IO;
+  pthru->cmd_status = 0xFF;
+  pthru->scsi_status = 0x0;
+  pthru->target_id = m_disknum;
+  pthru->lun = 0;
+  pthru->cdb_len = cdbLen;
+  pthru->timeout = 0;
+
+  switch (dxfer_dir) {
+  case DXFER_NONE:
+    pthru->flags = MFI_FRAME_DIR_NONE;
+    break;
+  case DXFER_FROM_DEVICE:
+    pthru->flags = MFI_FRAME_DIR_READ;
+    break;
+  case DXFER_TO_DEVICE:
+    pthru->flags = MFI_FRAME_DIR_WRITE;
+    break;
+  default:
+    pout("megasas_cmd: bad dxfer_dir\n");
+    return set_err(EINVAL, "megasas_cmd: bad dxfer_dir\n");
+  }
+
+  if (dataLen > 0) {
+    pthru->data_xfer_len = dataLen;
+    // Not used in Windows
+    //pthru->sge_count = 1;
+    //pthru->sgl.sge32[0].phys_addr = (intptr_t)data;
+    //pthru->sgl.sge32[0].length = (uint32_t)dataLen;
+  }
+  memcpy(pthru->cdb, cdb, cdbLen);
+
+  DWORD read_size = 0;
+  if (!DeviceIoControl(get_fh(), IOCTL_SCSI_MINIPORT,
+    ioc,
+    ioc_size,
+    ioc,
+    ioc_size,
+    &read_size, nullptr))
+  {
+    free(ioc);
+    return set_err(EINVAL, "megasas_cmd: bad DeviceIoControl, Error=%u\n", (unsigned)GetLastError());
+  }
+
+  if (read_size < sizeof(win_megasas_io) - 1) {
+    errno = EIO;
+    free(ioc);
+    return (-1);
+  }
+
+  if (pthru->cmd_status) {
+    int cmd_status = pthru->cmd_status;
+    free(ioc);
+
+    if (cmd_status == 12) {
+      return set_err(EIO, "megasas_cmd: Device %d does not exist\n", m_disknum);
+    }
+    return set_err((errno ? errno : EIO), "megasas_cmd result: %d.%d = %d/%d",
+      m_hba, m_disknum, errno,
+      cmd_status);
+  }
+
+  if (read_size - (sizeof(win_megasas_io) - 1) < pthru->data_xfer_len) {
+    errno = EIO;
+    free(ioc);
+    return (-1);
+  }
+
+  memcpy(data, ioc->DataBuffer, pthru->data_xfer_len);
+  free(ioc);
+
+  return true;
+}
+
+/* Issue passthrough scsi commands to PERC2/3/4 controllers */
+bool win_megaraid_device::megadev_cmd(int cdbLen, void *cdb,
+  int dataLen, void *data,
+  int /*senseLen*/, void * /*sense*/, int /*report*/, int /* dir */)
+{
+  //struct uioctl_t uio;
+  //int rc;
+
+  ///* Don't issue to the controller */
+  //if (m_disknum == 7)
+  //  return false;
+
+  //memset(&uio, 0, sizeof(uio));
+  //uio.inlen = dataLen;
+  //uio.outlen = dataLen;
+
+  //memset(data, 0, dataLen);
+  //uio.ui.fcs.opcode = 0x80;             // M_RD_IOCTL_CMD
+  //uio.ui.fcs.adapno = MKADAP(m_hba);
+
+  //uio.data.pointer = (uint8_t *)data;
+
+  //uio.mbox.cmd = MEGA_MBOXCMD_PASSTHRU;
+  //uio.mbox.xferaddr = (intptr_t)&uio.pthru;
+
+  //uio.pthru.ars = 1;
+  //uio.pthru.timeout = 2;
+  //uio.pthru.channel = 0;
+  //uio.pthru.target = m_disknum;
+  //uio.pthru.cdblen = cdbLen;
+  //uio.pthru.reqsenselen = MAX_REQ_SENSE_LEN;
+  //uio.pthru.dataxferaddr = (intptr_t)data;
+  //uio.pthru.dataxferlen = dataLen;
+  //memcpy(uio.pthru.cdb, cdb, cdbLen);
+
+  //rc = ioctl(m_fd, MEGAIOCCMD, &uio);
+  //if (uio.pthru.scsistatus || rc != 0) {
+  //  return set_err((errno ? errno : EIO), "megadev_cmd result: %d.%d =  %d/%d",
+  //    m_hba, m_disknum, errno,
+  //    uio.pthru.scsistatus);
+  //}
+  return true;
+}
+
 smart_device * win_smart_interface::get_custom_smart_device(const char * name, const char * type)
 {
   // Areca?
   int disknum = -1, n1 = -1, n2 = -1;
   int encnum = 1;
   char devpath[32];
+
+  // MegaRAID ?
+  if (sscanf(type, "megaraid,%d", &disknum) == 1) {
+    return new win_megaraid_device(this, name, disknum);
+  }
 
   if (sscanf(type, "areca,%n%d/%d%n", &n1, &disknum, &encnum, &n2) >= 1 || n1 == 6) {
     if (!(1 <= disknum && disknum <= 128)) {
@@ -4286,7 +4628,7 @@ smart_device * win_smart_interface::get_custom_smart_device(const char * name, c
 
 std::string win_smart_interface::get_valid_custom_dev_types_str()
 {
-  return "aacraid,H,L,ID, areca,N[/E]";
+  return "aacraid,H,L,ID, areca,N[/E], megaraid,N";
 }
 
 
@@ -4501,6 +4843,147 @@ smart_device * win_smart_interface::autodetect_smart_device(const char * name)
 }
 
 
+// getting devices from LSI SAS MegaRaid, if available
+bool win_smart_interface::get_dev_megasas(smart_device_list & devlist)
+{
+  /* Scanning of disks on MegaRaid device */
+  for (unsigned i = 0; i <= 32; i++) // trying to add devices on first 32 buses
+    megasas_pd_add_list(i, devlist);
+  return true;
+}
+
+int
+win_smart_interface::megasas_dcmd_cmd(int bus_no, uint32_t opcode, void *buf,
+  size_t bufsize, uint8_t *mbox, size_t mboxlen, uint8_t *statusp)
+{
+  if ((mbox != NULL && (mboxlen == 0 || mboxlen > MFI_MBOX_SIZE)) ||
+    (mbox == NULL && mboxlen != 0))
+  {
+    errno = EINVAL;
+    return (-1);
+  }
+
+  char line[128];
+  snprintf(line, sizeof(line) - 1, "\\\\.\\scsi%d:", bus_no);
+  HANDLE h = CreateFileA(line, GENERIC_READ | GENERIC_WRITE,
+    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0);
+
+  if (h == INVALID_HANDLE_VALUE) {
+    return (-1);
+  }
+
+  const size_t ioc_size = sizeof(win_megasas_io) + bufsize;
+  win_megasas_io *ioc = (win_megasas_io *)malloc(ioc_size);
+  memset(ioc, 0, ioc_size);
+
+  ioc->SRB.HeaderLength = sizeof(SRB_IO_CONTROL);
+  memcpy(ioc->SRB.Signature, "LSILOGIC", 8);
+  ioc->SRB.Timeout = 0;
+  ioc->SRB.ControlCode = 0;
+  ioc->SRB.Length = sizeof(ioc->Payload) + 1 + bufsize;
+
+  struct megasas_dcmd_frame * dcmd = (struct megasas_dcmd_frame *)&ioc->Payload;
+  if (mbox)
+    memcpy(dcmd->mbox.w, mbox, mboxlen);
+  dcmd->cmd = MFI_CMD_DCMD;
+  dcmd->timeout = 0;
+  dcmd->flags = 0;
+  dcmd->data_xfer_len = bufsize;
+  dcmd->opcode = opcode;
+
+  if (bufsize > 0) {
+    dcmd->data_xfer_len = bufsize;
+    // Not used in Windows
+    //dcmd->sge_count = 1;
+    //dcmd->sgl.sge32[0].phys_addr = (intptr_t)buf;
+    //dcmd->sgl.sge32[0].length = (uint32_t)bufsize;
+  }
+
+  DWORD read_size = 0;
+  if (!DeviceIoControl(h, IOCTL_SCSI_MINIPORT,
+    ioc,
+    ioc_size,
+    ioc,
+    ioc_size,
+    &read_size, nullptr))
+  {
+    free(ioc);
+    CloseHandle(h);
+    return (-1);
+  }
+
+  CloseHandle(h);
+
+  if (read_size < sizeof(win_megasas_io) - 1) {
+    errno = EIO;
+    free(ioc);
+    return (-1);
+  }
+
+  if (statusp != NULL)
+    *statusp = dcmd->cmd_status;
+  else if (dcmd->cmd_status != MFI_STAT_OK) {
+    fprintf(stderr, "command %x returned error status %x\n",
+      opcode, dcmd->cmd_status);
+    errno = EIO;
+    free(ioc);
+    return (-1);
+  }
+
+  if (read_size - (sizeof(win_megasas_io) - 1) < dcmd->data_xfer_len) {
+    errno = EIO;
+    free(ioc);
+    return (-1);
+  }
+
+  memcpy(buf, ioc->DataBuffer, dcmd->data_xfer_len);
+
+  free(ioc);
+  return (0);
+}
+
+int
+win_smart_interface::megasas_pd_add_list(int bus_no, smart_device_list & devlist)
+{
+  /*
+  * Keep fetching the list in a loop until we have a large enough
+  * buffer to hold the entire list.
+  */
+  megasas_pd_list * list = 0;
+  for (unsigned list_size = 1024; ; ) {
+    list = reinterpret_cast<megasas_pd_list *>(realloc(list, list_size));
+    if (!list)
+      throw std::bad_alloc();
+    memset(list, 0, list_size);
+    if (megasas_dcmd_cmd(bus_no, MFI_DCMD_PD_GET_LIST, list, list_size, NULL, 0,
+      NULL) < 0)
+    {
+      free(list);
+      return (-1);
+    }
+    if (list->size <= list_size)
+      break;
+    list_size = list->size;
+  }
+
+  // adding all SCSI devices
+  for (unsigned i = 0; i < list->count; i++) {
+    if (list->addr[i].scsi_dev_type)
+      continue; /* non disk device found */
+    char line[128];
+    if (bus_no + 'a' <= 'z')
+      snprintf(line, sizeof(line), "/dev/sd%c", bus_no + 'a');
+    else
+      snprintf(line, sizeof(line), "/dev/sd%c%c",
+        bus_no / ('z' - 'a' + 1) - 1 + 'a',
+        bus_no % ('z' - 'a' + 1) + 'a');
+    smart_device * dev = new win_megaraid_device(this, line, list->addr[i].device_id);
+    devlist.push_back(dev);
+  }
+  free(list);
+  return (0);
+}
+
 // Scan for devices
 bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
   const char * type, const char * pattern /* = 0*/)
@@ -4688,6 +5171,12 @@ bool win_smart_interface::scan_smart_devices(smart_device_list & devlist,
       devlist.push_back( new win_nvme_device(this, name, "nvme", 0) );
     }
   }
+
+  if (scsi) {
+    // get device list from the megaraid device
+    get_dev_megasas(devlist);
+  }
+
   return true;
 }
 
